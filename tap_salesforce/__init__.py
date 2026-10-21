@@ -23,7 +23,6 @@ from tap_salesforce.salesforce.exceptions import (
     TapSalesforceQuotaExceededError,
 )
 from tap_salesforce.sync import (
-    filter_catalog_by_record_count,
     get_stream_version,
     resume_syncing_bulk_query,
     sync_stream,
@@ -127,30 +126,15 @@ def create_property_schema(field, mdata):
     return (property_schema, mdata)
 
 
-def do_discover(sf: Salesforce, streams: list[str]):  # noqa: C901
+def _iter_object_descriptions(sf: Salesforce, streams: list[str]):
+    """Yield descriptions of supported, nonempty objects in batches of up to 25."""
     if not streams:
-        """Describes a Salesforce instance's objects and generates a JSON schema for each field."""
         LOGGER.info("Start discovery for all streams")
         global_description = sf.describe()
         objects_to_discover = {o["name"] for o in global_description["sobjects"]}
     else:
         LOGGER.info(f"Start discovery: {streams=}")
         objects_to_discover = streams
-
-    # Filter object names before requesting their field descriptions.
-    candidates = {
-        "streams": [
-            {"stream": name, "tap_stream_id": name}
-            for name in objects_to_discover
-        ]
-    }
- 
-    objects_to_discover = [entry["stream"] for entry in candidates["streams"]]
-
-    key_properties = ["Id"]
-
-    sf_custom_setting_objects = []
-    object_to_tag_references = {}
 
     # Build batches of SF sbjects. 25 per batch.
     sobject_batches = []
@@ -169,144 +153,140 @@ def do_discover(sf: Salesforce, streams: list[str]):  # noqa: C901
     if len(batch) > 0:
         sobject_batches.append(batch)
 
-    # For each SF Object describe it, loop its fields and build a schema
-    entries = []
     for batch in sobject_batches:
-        sobject_descriptions = sf.describe(batch)
+        batch = sf.get_nonempty_objects(batch)
+        if not batch:
+            continue
+        for subrequest_result in sf.describe(batch):
+            yield subrequest_result["result"]
 
-        for subrequest_result in sobject_descriptions:
-            sobject_description = subrequest_result["result"]
-            sobject_name = sobject_description["name"]
 
-            # Cache customSetting and Tag objects to check for blacklisting after
-            # all objects have been described
-            if sobject_description.get("customSetting"):
-                sf_custom_setting_objects.append(sobject_name)
-            elif sobject_name.endswith("__Tag"):
-                relationship_field = next(
-                    (f for f in sobject_description["fields"] if f.get("relationshipName") == "Item"),
-                    None,
-                )
-                if relationship_field:
-                    # Map {"Object":"Object__Tag"}
-                    object_to_tag_references[relationship_field["referenceTo"][0]] = sobject_name
+def _build_catalog_entry(sf: Salesforce, description):  # noqa: C901
+    """Build one catalog entry, or return None for objects without an Id field."""
+        
+    sobject_name = description["name"]
+    fields = description["fields"]
 
-            fields = sobject_description["fields"]
-            replication_key = get_replication_key(sobject_name, fields)
+    if not any(field["name"] == "Id" for field in fields):
+        LOGGER.info("Skipping Salesforce Object %s, as it has no Id field", sobject_name)
+        return None
 
-            unsupported_fields = set()
-            properties = {}
-            mdata = metadata.new()
+    replication_key = get_replication_key(sobject_name, fields)
+    unsupported_fields = set()
+    properties = {}
+    mdata = metadata.new()
 
-            found_id_field = False
+    # Loop over the object's fields
+    for f in fields:
+        field_name = f["name"]
+        field_type = f["type"]
 
-            # Loop over the object's fields
-            for f in fields:
-                field_name = f["name"]
-                field_type = f["type"]  # noqa: F841
+        property_schema, mdata = create_property_schema(f, mdata)
 
-                if field_name == "Id":
-                    found_id_field = True
+        # Compound Address fields cannot be queried by the Bulk API
+        if f["type"] in ("address", "location", "base64") and sf.api_type in [
+            tap_salesforce.salesforce.BULK_API_TYPE,
+            tap_salesforce.salesforce.BULK2_API_TYPE,
+        ]:
+            unsupported_fields.add((field_name, f"cannot query {field_type} fields with bulk API"))
 
-                property_schema, mdata = create_property_schema(f, mdata)
+        # Blacklisted fields are dependent on the api_type being used
+        field_pair = (sobject_name, field_name)
+        if field_pair in sf.get_blacklisted_fields():
+            unsupported_fields.add((field_name, sf.get_blacklisted_fields()[field_pair]))
 
-                # Compound Address fields cannot be queried by the Bulk API
-                if f["type"] in ("address", "location", "base64") and sf.api_type in [
-                    tap_salesforce.salesforce.BULK_API_TYPE,
-                    tap_salesforce.salesforce.BULK2_API_TYPE,
-                ]:
-                    unsupported_fields.add((field_name, "cannot query compound address fields with bulk API"))
+        inclusion = metadata.get(mdata, ("properties", field_name), "inclusion")
 
-                # we haven't been able to observe any records with a json field, so we
-                # are marking it as unavailable until we have an example to work with
-                if f["type"] == "json":
-                    unsupported_fields.add(
-                        (
-                            field_name,
-                            "do not currently support json fields - please contact support",
-                        )
-                    )
+        if sf.select_fields_by_default and inclusion != "unsupported":
+            mdata = metadata.write(mdata, ("properties", field_name), "selected-by-default", True)
 
-                # Blacklisted fields are dependent on the api_type being used
-                field_pair = (sobject_name, field_name)
-                if field_pair in sf.get_blacklisted_fields():
-                    unsupported_fields.add((field_name, sf.get_blacklisted_fields()[field_pair]))
+        properties[field_name] = property_schema
 
-                inclusion = metadata.get(mdata, ("properties", field_name), "inclusion")
+    if replication_key:
+        mdata = metadata.write(mdata, ("properties", replication_key), "inclusion", "automatic")
 
-                if sf.select_fields_by_default and inclusion != "unsupported":
-                    mdata = metadata.write(mdata, ("properties", field_name), "selected-by-default", True)
+    # There are cases where compound fields are referenced by the associated
+    # subfields but are not actually present in the field list
+    field_name_set = {f["name"] for f in fields}
+    filtered_unsupported_fields = [f for f in unsupported_fields if f[0] in field_name_set]
+    missing_unsupported_field_names = [f[0] for f in unsupported_fields if f[0] not in field_name_set]
 
-                properties[field_name] = property_schema
+    if missing_unsupported_field_names:
+        LOGGER.info(
+            "Ignoring the following unsupported fields for object %s as they are missing" + "from the field list: %s",
+            sobject_name,
+            ", ".join(sorted(missing_unsupported_field_names)),
+        )
 
-            if replication_key:
-                mdata = metadata.write(mdata, ("properties", replication_key), "inclusion", "automatic")
+    if filtered_unsupported_fields:
+        LOGGER.info(
+            "Not syncing the following unsupported fields for object %s: %s",
+            sobject_name,
+            ", ".join(sorted([k for k, _ in filtered_unsupported_fields])),
+        )
 
-            # There are cases where compound fields are referenced by the associated
-            # subfields but are not actually present in the field list
-            field_name_set = {f["name"] for f in fields}
-            filtered_unsupported_fields = [f for f in unsupported_fields if f[0] in field_name_set]
-            missing_unsupported_field_names = [f[0] for f in unsupported_fields if f[0] not in field_name_set]
+    # Any property added to unsupported_fields has metadata generated and
+    # removed
+    for prop, unsupported_description in filtered_unsupported_fields:
+        if metadata.get(mdata, ("properties", prop), "selected-by-default"):
+            metadata.delete(mdata, ("properties", prop), "selected-by-default")
 
-            if missing_unsupported_field_names:
-                LOGGER.info(
-                    "Ignoring the following unsupported fields for object %s as they are missing"
-                    + "from the field list: %s",
-                    sobject_name,
-                    ", ".join(sorted(missing_unsupported_field_names)),
-                )
+        mdata = metadata.write(mdata, ("properties", prop), "unsupported-description", unsupported_description)
+        mdata = metadata.write(mdata, ("properties", prop), "inclusion", "unsupported")
 
-            if filtered_unsupported_fields:
-                LOGGER.info(
-                    "Not syncing the following unsupported fields for object %s: %s",
-                    sobject_name,
-                    ", ".join(sorted([k for k, _ in filtered_unsupported_fields])),
-                )
+    if replication_key:
+        mdata = metadata.write(mdata, (), "valid-replication-keys", [replication_key])
+        mdata = metadata.write(mdata, (), "replication-key", replication_key)
+        mdata = metadata.write(mdata, (), "replication-method", "INCREMENTAL")
+    else:
+        mdata = metadata.write(mdata, (), "forced-replication-method",
+            {
+                "replication-method": "FULL_TABLE",
+                "reason": "No replication keys found from the Salesforce API",
+            },
+        )
 
-            # Salesforce Objects are skipped when they do not have an Id field
-            if not found_id_field:
-                LOGGER.info("Skipping Salesforce Object %s, as it has no Id field", sobject_name)
-                continue
+    mdata = metadata.write(mdata, (), "table-key-properties", ["Id"])
 
-            # Any property added to unsupported_fields has metadata generated and
-            # removed
-            for prop, description in filtered_unsupported_fields:
-                if metadata.get(mdata, ("properties", prop), "selected-by-default"):
-                    metadata.delete(mdata, ("properties", prop), "selected-by-default")
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": properties,
+    }
 
-                mdata = metadata.write(mdata, ("properties", prop), "unsupported-description", description)
-                mdata = metadata.write(mdata, ("properties", prop), "inclusion", "unsupported")
+    entry = {
+        "stream": sobject_name,
+        "tap_stream_id": sobject_name,
+        "schema": schema,
+        "metadata": metadata.to_list(mdata),
+    }
 
-            if replication_key:
-                mdata = metadata.write(mdata, (), "valid-replication-keys", [replication_key])
-                mdata = metadata.write(mdata, (), "replication-key", replication_key)
-                mdata = metadata.write(mdata, (), "replication-method", "INCREMENTAL")
-            else:
-                mdata = metadata.write(
-                    mdata,
-                    (),
-                    "forced-replication-method",
-                    {
-                        "replication-method": "FULL_TABLE",
-                        "reason": "No replication keys found from the Salesforce API",
-                    },
-                )
+    return entry
 
-            mdata = metadata.write(mdata, (), "table-key-properties", key_properties)
 
-            schema = {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": properties,
-            }
+def _build_discovery_catalog(sf: Salesforce, descriptions):
+    """Build entries as descriptions arrive, then exclude unsupported custom setting tags."""
+    sf_custom_setting_objects = []
+    object_to_tag_references = {}
+    entries = []
+    for description in descriptions:
+        sobject_name = description["name"]
 
-            entry = {
-                "stream": sobject_name,
-                "tap_stream_id": sobject_name,
-                "schema": schema,
-                "metadata": metadata.to_list(mdata),
-            }
+        # Cache customSetting and Tag objects to check for blacklisting after
+        # all objects have been described
+        if description.get("customSetting"):
+            sf_custom_setting_objects.append(sobject_name)
+        elif sobject_name.endswith("__Tag"):
+            relationship_field = next(
+                (f for f in description["fields"] if f.get("relationshipName") == "Item"),
+                None,
+            )
+            if relationship_field:
+                # Map {"Object":"Object__Tag"}
+                object_to_tag_references[relationship_field["referenceTo"][0]] = sobject_name
 
+        entry = _build_catalog_entry(sf, description)
+        if entry is not None:
             entries.append(entry)
 
     # For each custom setting field, remove its associated tag from entries
@@ -322,8 +302,14 @@ def do_discover(sf: Salesforce, streams: list[str]):  # noqa: C901
         LOGGER.info(unsupported_tag_objects)
         entries = [e for e in entries if e["stream"] not in unsupported_tag_objects]
 
-    result = {"streams": entries}
-    json.dump(result, sys.stdout, indent=4)
+    return {"streams": entries}
+
+
+def do_discover(sf: Salesforce, streams: list[str]):
+    """Discover objects and write the complete Singer catalog to stdout."""
+    descriptions = _iter_object_descriptions(sf, streams)
+    catalog = _build_discovery_catalog(sf, descriptions)
+    json.dump(catalog, sys.stdout, indent=4)
 
 
 def is_object_type(property_schema):
@@ -492,13 +478,6 @@ async def sync_catalog_entry(sf, catalog_entry, state):
 
 def do_sync(sf, catalog, state):
     LOGGER.info("Starting sync")
-
-    catalog = filter_catalog_by_record_count(
-        sf,
-        catalog,
-        state,
-        enabled=False,
-    )
 
     max_workers = CONFIG.get("max_workers", 8)
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)

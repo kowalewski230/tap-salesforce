@@ -1,6 +1,7 @@
 import json
 import re
 from datetime import timedelta
+from urllib.parse import urlencode
 
 import backoff
 import requests
@@ -73,7 +74,15 @@ UNSUPPORTED_BULK_API_SALESFORCE_OBJECTS = {
     "TaskPriority",
     "CaseStatus",
     "UndecidedEventRelation",
+    "ProductServiceCampaignItemStatus",
     "OrderStatus",
+    "Site",
+    "UserListViewCriterion",
+    "PromptVersion",
+    "Prompt",
+    "CategoryNode",
+    "ContentWorkspaceMember",
+    "ContentFolderLink"
 }
 
 # The following objects have certain WHERE clause restrictions so we exclude them.
@@ -131,14 +140,7 @@ QUERY_INCOMPATIBLE_SALESFORCE_OBJECTS = {
     "NoteAndAttachment",
     "LookedUpFromActivity",
     "AttachedContentNote",
-    "QuoteTemplateRichTextData",
-    "Site",
-    "UserListViewCriterion",
-    "PromptVersion",
-    "Prompt",
-    "CategoryNode",
-    "ContentWorkspaceMember",
-    "ContentFolderLink"
+    "QuoteTemplateRichTextData"
 }
 
 
@@ -335,6 +337,56 @@ class Salesforce:
             self.check_rest_quota_usage(resp.headers)
 
         return resp
+
+    def get_nonempty_objects(self, objects):
+        """Return objects with at least one queryAll record, in input order."""
+        if len(objects) > 25:
+            raise TapSalesforceExceptionError("Composite limited to 25 sObjects per batch.")
+        if not objects:
+            return []
+
+        subrequests = [
+            {
+                "method": "GET",
+                "url": self.data_url.format("", "queryAll")
+                + "?"
+                + urlencode({"q": f"SELECT Id FROM {name} LIMIT 1"}),
+            }
+            for name in objects
+        ]
+        headers = {**self.auth.rest_headers, "Content-Type": "application/json"}
+        response = self._make_request(
+            "POST",
+            self.data_url.format(self.instance_url, "composite/batch"),
+            headers=headers,
+            body=json.dumps({"batchRequests": subrequests}),
+        ).json()
+        results = response.get("results") if isinstance(response, dict) else None
+        if not isinstance(results, list) or len(results) != len(objects):
+            raise TapSalesforceExceptionError("Invalid record existence response: expected one result per object.")
+
+        nonempty = []
+        for name, item in zip(objects, results):
+            if not isinstance(item, dict) or item.get("statusCode") != 200:
+                raise TapSalesforceExceptionError(f"Record existence query failed for {name}: {item}")
+            result = item.get("result")
+            records = result.get("records") if isinstance(result, dict) else None
+            if not isinstance(records, list) or any(
+                not isinstance(record, dict) or not isinstance(record.get("Id"), str) for record in records
+            ):
+                raise TapSalesforceExceptionError(f"Invalid record existence response for {name}: {result}")
+            if (
+                result.get("done") is not True
+                or type(result.get("totalSize")) is not int
+                or result["totalSize"] != len(records)
+                or len(records) > 1
+            ):
+                raise TapSalesforceExceptionError(f"Inconsistent record existence response for {name}: {result}")
+            if records:
+                nonempty.append(name)
+            else:
+                LOGGER.info("Skipping Salesforce Object %s, as it has no queryAll records", name)
+        return nonempty
 
     def describe(self, sobject=None):
         """Describes all objects or a specific object"""
