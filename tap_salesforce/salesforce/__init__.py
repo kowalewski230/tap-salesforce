@@ -82,7 +82,8 @@ UNSUPPORTED_BULK_API_SALESFORCE_OBJECTS = {
     "Prompt",
     "CategoryNode",
     "ContentWorkspaceMember",
-    "ContentFolderLink"
+    "ContentFolderLink",
+    'ShiftStatus'
 }
 
 # The following objects have certain WHERE clause restrictions so we exclude them.
