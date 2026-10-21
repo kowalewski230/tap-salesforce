@@ -93,6 +93,7 @@ QUERY_RESTRICTED_SALESFORCE_OBJECTS = {
     "IdeaComment",
     "FieldDefinition",
     "PlatformAction",
+    "PlatformEventUsageMetric",  # Requires specialized queries and does not support LIMIT.
     "UserEntityAccess",
     "RelationshipInfo",
     "ContentFolderMember",
