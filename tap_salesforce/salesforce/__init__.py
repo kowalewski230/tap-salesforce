@@ -380,14 +380,14 @@ class Salesforce:
             if not isinstance(records, list) or any(
                 not isinstance(record, dict) or not isinstance(record.get("Id"), str) for record in records
             ):
-                raise TapSalesforceExceptionError(f"Invalid record existence response for {name}: {result}")
+                raise TapSalesforceExceptionError(f"Invalid record existence response for {name}: {str(result)[:2000]}")
             if (
                 result.get("done") is not True
                 or type(result.get("totalSize")) is not int
                 or result["totalSize"] != len(records)
                 or len(records) > 1
             ):
-                raise TapSalesforceExceptionError(f"Inconsistent record existence response for {name}: {result}")
+                raise TapSalesforceExceptionError(f"Inconsistent record existence response for {name}: {str(result)[:2000]}")
             if records:
                 nonempty.append(name)
             else:
