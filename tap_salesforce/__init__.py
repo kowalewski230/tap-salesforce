@@ -502,7 +502,7 @@ def do_sync(sf, catalog, state):
         sf,
         catalog,
         state,
-        enabled=True,
+        enabled=False,
     )
 
     max_workers = CONFIG.get("max_workers", 8)
