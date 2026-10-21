@@ -368,7 +368,8 @@ class Salesforce:
         nonempty = []
         for name, item in zip(objects, results):
             if not isinstance(item, dict) or item.get("statusCode") != 200:
-                raise TapSalesforceExceptionError(f"Record existence query failed for {name}: {item}")
+                LOGGER.error("Record existence query failed for %s: %s. Skipping object.", name, item)
+                continue
             result = item.get("result")
             records = result.get("records") if isinstance(result, dict) else None
             if not isinstance(records, list) or any(
