@@ -132,6 +132,13 @@ QUERY_INCOMPATIBLE_SALESFORCE_OBJECTS = {
     "LookedUpFromActivity",
     "AttachedContentNote",
     "QuoteTemplateRichTextData",
+    "Site",
+    "UserListViewCriterion",
+    "PromptVersion",
+    "Prompt",
+    "CategoryNode",
+    "ContentWorkspaceMember",
+    "ContentFolderLink"
 }
 
 

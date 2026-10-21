@@ -195,26 +195,58 @@ def sync_records(sf, catalog_entry, state, counter, state_msg_threshold):
 
 
 def fix_record_anytype(rec, schema):
-    """Modifies a record when the schema has no 'type' element due to a SF type of 'anyType.'
-    Attempts to set the record's value for that element to an int, float, or string."""
-
-    def try_cast(val, coercion):
-        try:
-            return coercion(val)
-        except BaseException:
-            return val
-
-    for k, v in rec.items():
-        if schema["properties"][k].get("type") is None:
-            val = v
-            val = try_cast(v, int)
-            val = try_cast(v, float)
-            if v in ["true", "false"]:
-                val = v == "true"
-
-            if v == "":
-                val = None
-
-            rec[k] = val
+    """Preserve Salesforce anyType values as strings or null."""
+    for key, value in rec.items():
+        if schema["properties"][key].get("type") is None:
+            if value is None or value == "":
+                rec[key] = None
+            else:
+                rec[key] = str(value)
 
     return rec
+
+
+def filter_catalog_by_record_count(sf, catalog, state, enabled=False):
+    """Skip missing/zero-count streams before emitting schemas.
+
+    Counts are cached and exclude deleted/archived records. Existing target
+    tables are not cleared when a stream is skipped. Pending Bulk jobs resume.
+    """
+    enabled = enabled is True or (isinstance(enabled, str) and enabled.lower() == "true")
+    if not enabled:
+        return catalog
+
+    response = sf._make_request(
+        "GET",
+        f"{sf.instance_url}/services/data/v67.0/limits/recordCount",
+        headers=sf.auth.rest_headers,
+    )
+    response.raise_for_status()
+    objects = response.json().get("sObjects")
+    if not isinstance(objects, list):
+        raise ValueError("Invalid recordCount response: missing sObjects list")
+
+    counts = {}
+    for obj in objects:
+        if not isinstance(obj, dict):
+            raise ValueError("Invalid recordCount entry")
+        name, count = obj.get("name"), obj.get("count")
+        if not isinstance(name, str) or type(count) is not int or count < 0:
+            raise ValueError("Invalid recordCount entry: name/count")
+        counts[name] = count
+
+    streams = []
+    bookmarks = state.get("bookmarks", {})
+    for entry in catalog["streams"]:
+        name = entry["stream"]
+        if (bookmarks.get(entry["tap_stream_id"]) or {}).get("JobID"):
+            streams.append(entry)
+        elif name not in counts:
+            LOGGER.info("%s: Skipping - absent from recordCount", name)
+        elif counts[name] == 0:
+            LOGGER.info("%s: Skipping - recordCount is zero", name)
+        else:
+            streams.append(entry)
+
+    LOGGER.info("recordCount filter: keeping %d of %d streams", len(streams), len(catalog["streams"]))
+    return {**catalog, "streams": streams}

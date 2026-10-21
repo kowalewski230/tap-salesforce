@@ -23,6 +23,7 @@ from tap_salesforce.salesforce.exceptions import (
     TapSalesforceQuotaExceededError,
 )
 from tap_salesforce.sync import (
+    filter_catalog_by_record_count,
     get_stream_version,
     resume_syncing_bulk_query,
     sync_stream,
@@ -136,6 +137,21 @@ def do_discover(sf: Salesforce, streams: list[str]):  # noqa: C901
         LOGGER.info(f"Start discovery: {streams=}")
         objects_to_discover = streams
 
+    # Filter object names before requesting their field descriptions.
+    candidates = {
+        "streams": [
+            {"stream": name, "tap_stream_id": name}
+            for name in objects_to_discover
+        ]
+    }
+    filtered = filter_catalog_by_record_count(
+        sf,
+        candidates,
+        state={},
+        enabled=True,
+    )
+    objects_to_discover = [entry["stream"] for entry in filtered["streams"]]
+
     key_properties = ["Id"]
 
     sf_custom_setting_objects = []
@@ -200,7 +216,7 @@ def do_discover(sf: Salesforce, streams: list[str]):  # noqa: C901
                 property_schema, mdata = create_property_schema(f, mdata)
 
                 # Compound Address fields cannot be queried by the Bulk API
-                if f["type"] in ("address", "location") and sf.api_type in [
+                if f["type"] in ("address", "location", "base64") and sf.api_type in [
                     tap_salesforce.salesforce.BULK_API_TYPE,
                     tap_salesforce.salesforce.BULK2_API_TYPE,
                 ]:
@@ -481,6 +497,13 @@ async def sync_catalog_entry(sf, catalog_entry, state):
 
 def do_sync(sf, catalog, state):
     LOGGER.info("Starting sync")
+
+    catalog = filter_catalog_by_record_count(
+        sf,
+        catalog,
+        state,
+        enabled=True,
+    )
 
     max_workers = CONFIG.get("max_workers", 8)
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
