@@ -387,7 +387,9 @@ class Salesforce:
                 or result["totalSize"] != len(records)
                 or len(records) > 1
             ):
-                raise TapSalesforceExceptionError(f"Inconsistent record existence response for {name}: {str(result)[:2000]}")
+                raise TapSalesforceExceptionError(
+                    f"Inconsistent record existence response for {name}: {str(result)[:2000]}"
+                )
             if records:
                 nonempty.append(name)
             else:
