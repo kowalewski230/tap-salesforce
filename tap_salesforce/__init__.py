@@ -144,13 +144,8 @@ def do_discover(sf: Salesforce, streams: list[str]):  # noqa: C901
             for name in objects_to_discover
         ]
     }
-    filtered = filter_catalog_by_record_count(
-        sf,
-        candidates,
-        state={},
-        enabled=True,
-    )
-    objects_to_discover = [entry["stream"] for entry in filtered["streams"]]
+ 
+    objects_to_discover = [entry["stream"] for entry in candidates["streams"]]
 
     key_properties = ["Id"]
 
