@@ -127,7 +127,7 @@ def create_property_schema(field, mdata):
 
 
 def _iter_object_descriptions(sf: Salesforce, streams: list[str]):
-    """Yield descriptions of supported, nonempty objects in batches of up to 25."""
+    """Yield descriptions of supported objects in batches of up to 25."""
     if not streams:
         LOGGER.info("Start discovery for all streams")
         global_description = sf.describe()
@@ -154,9 +154,6 @@ def _iter_object_descriptions(sf: Salesforce, streams: list[str]):
         sobject_batches.append(batch)
 
     for batch in sobject_batches:
-        batch = sf.get_nonempty_objects(batch)
-        if not batch:
-            continue
         for subrequest_result in sf.describe(batch):
             yield subrequest_result["result"]
 
