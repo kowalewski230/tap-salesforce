@@ -340,19 +340,61 @@ class Salesforce:
 
         return resp
 
-    def get_nonempty_objects(self, objects):
-        """Return objects with at least one queryAll record, in input order."""
-        if len(objects) > 25:
-            raise TapSalesforceExceptionError("Composite limited to 25 sObjects per batch.")
+    def get_nonempty_objects(self, objects, state=None):
+        """Filter discovery names, or catalog entries using the supplied sync state.
+
+        Discovery requires one record. Sync requires two matching incremental
+        records, keeps full-table and resumed streams, and fails on query errors.
+        """
         if not objects:
             return []
 
+        if state is None:
+            if len(objects) > 25:
+                raise TapSalesforceExceptionError("Composite limited to 25 sObjects per batch.")
+            queries = {name: f"SELECT Id FROM {name} LIMIT 1" for name in objects}
+        else:
+            queries = {}
+            for entry in objects:
+                stream_metadata = metadata.to_map(entry["metadata"]).get((), {})
+                if (
+                    stream_metadata.get("selected", False)
+                    and stream_metadata.get("replication-method") == "INCREMENTAL"
+                    and stream_metadata.get("replication-key")
+                    and not singer.get_bookmark(state, entry["tap_stream_id"], "JobID")
+                ):
+                    start_date = self.get_start_date(state, entry)
+                    replication_key = stream_metadata["replication-key"]
+                    query_filter = f" WHERE {replication_key} >= {start_date}"
+                    queries[entry["tap_stream_id"]] = f"SELECT Id FROM {entry['stream']}{query_filter} LIMIT 2"
+
+        nonempty_ids = set()
+        query_items = list(queries.items())
+        for offset in range(0, len(query_items), 25):
+            batch = dict(query_items[offset : offset + 25])
+            nonempty_ids.update(
+                self._get_nonempty_objects_batch(
+                    batch, fail_on_error=state is not None, min_records=1 if state is None else 2
+                )
+            )
+
+        if state is None:
+            return [name for name in objects if name in nonempty_ids]
+        return [
+            entry
+            for entry in objects
+            if entry["tap_stream_id"] not in queries or entry["tap_stream_id"] in nonempty_ids
+        ]
+
+    def _get_nonempty_objects_batch(self, queries, fail_on_error=False, min_records=1):
+        """Execute and validate up to 25 queryAll record existence checks."""
+        objects = list(queries)
         subrequests = [
             {
                 "method": "GET",
                 "url": self.data_url.format("", "queryAll")
                 + "?"
-                + urlencode({"q": f"SELECT Id FROM {name} LIMIT 1"}),
+                + urlencode({"q": queries[name]}),
             }
             for name in objects
         ]
@@ -370,6 +412,8 @@ class Salesforce:
         nonempty = []
         for name, item in zip(objects, results):
             if not isinstance(item, dict) or item.get("statusCode") != 200:
+                if fail_on_error:
+                    raise TapSalesforceExceptionError(f"Record existence query failed for {name}: {str(item)[:2000]}")
                 LOGGER.error(
                     "Record existence query failed for %s: %.2000s. Skipping object.",
                     name,
@@ -387,15 +431,19 @@ class Salesforce:
                 result.get("done") is not True
                 or type(result.get("totalSize")) is not int
                 or result["totalSize"] != len(records)
-                or len(records) > 1
+                or len(records) > min_records
             ):
                 raise TapSalesforceExceptionError(
                     f"Inconsistent record existence response for {name}: {str(result)[:2000]}"
                 )
-            if records:
+            if len(records) >= min_records:
                 nonempty.append(name)
             else:
-                LOGGER.info("Skipping Salesforce Object %s, as it has no queryAll records", name)
+                LOGGER.info(
+                    "Skipping Salesforce Object %s, as it has fewer than %s matching queryAll records",
+                    name,
+                    min_records,
+                )
         return nonempty
 
     def describe(self, sobject=None):

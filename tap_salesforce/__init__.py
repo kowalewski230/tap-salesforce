@@ -486,6 +486,8 @@ def do_sync(sf, catalog, state):
 
     try:
         streams_to_sync = catalog["streams"]
+        if sf.api_type == tap_salesforce.salesforce.BULK2_API_TYPE:
+            streams_to_sync = sf.get_nonempty_objects(streams_to_sync, state=state)
 
         # Schedule one task for each catalog entry to be extracted
         # and run them concurrently.
